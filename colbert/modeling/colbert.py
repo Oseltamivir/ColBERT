@@ -50,37 +50,46 @@ class ColBERT(BaseColBERT):
 
         cls.loaded_extensions = True
 
-    def forward(self, Q, D):
+    def forward(self, Q, D, nway_override=None):
+    # Use per-batch nway when provided (dynamic nway training); otherwise fall back to config.nway.
+        nway = int(nway_override) if nway_override is not None else self.colbert_config.nway
+
         Q = self.query(*Q)
         D, D_mask = self.doc(*D, keep_dims='return_mask')
 
-        # Repeat each query encoding for every corresponding document.
-        Q_duplicated = Q.repeat_interleave(self.colbert_config.nway, dim=0).contiguous()
+        # Repeat each query encoding for every corresponding document in this batch.
+        Q_duplicated = Q.repeat_interleave(nway, dim=0).contiguous()
         scores = self.score(Q_duplicated, D, D_mask)
 
         if self.colbert_config.use_ib_negatives:
-            ib_loss = self.compute_ib_loss(Q, D, D_mask)
+            ib_loss = self.compute_ib_loss(Q, D, D_mask, nway_override=nway)
             return scores, ib_loss
 
         return scores
 
-    def compute_ib_loss(self, Q, D, D_mask):
+    def compute_ib_loss(self, Q, D, D_mask, nway_override=None):
+        # Use the same nway used in forward()
+        nway = int(nway_override) if nway_override is not None else self.colbert_config.nway
+
         # TODO: Organize the code below! Quite messy.
         scores = (D.unsqueeze(0) @ Q.permute(0, 2, 1).unsqueeze(1)).flatten(0, 1)  # query-major unsqueeze
-
         scores = colbert_score_reduce(scores, D_mask.repeat(Q.size(0), 1, 1), self.colbert_config)
 
-        nway = self.colbert_config.nway
-        all_except_self_negatives = [list(range(qidx*D.size(0), qidx*D.size(0) + nway*qidx+1)) +
-                                     list(range(qidx*D.size(0) + nway * (qidx+1), qidx*D.size(0) + D.size(0)))
-                                     for qidx in range(Q.size(0))]
+        # Build "all except self" negatives with the correct nway
+        all_except_self_negatives = [
+            list(range(qidx * D.size(0), qidx * D.size(0) + nway * qidx + 1)) +
+            list(range(qidx * D.size(0) + nway * (qidx + 1), qidx * D.size(0) + D.size(0)))
+            for qidx in range(Q.size(0))
+        ]
 
         scores = scores[flatten(all_except_self_negatives)]
-        scores = scores.view(Q.size(0), -1)  # D.size(0) - self.colbert_config.nway + 1)
+        scores = scores.view(Q.size(0), -1)
 
-        labels = torch.arange(0, Q.size(0), device=scores.device) * (self.colbert_config.nway)
+        # Labels step in multiples of nway
+        labels = torch.arange(0, Q.size(0), device=scores.device) * nway
 
         return torch.nn.CrossEntropyLoss()(scores, labels)
+
 
     def query(self, input_ids, attention_mask):
         input_ids, attention_mask = input_ids.to(self.device), attention_mask.to(self.device)
